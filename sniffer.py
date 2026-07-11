@@ -1,15 +1,15 @@
 import sys
+import argparse
 from scapy.all import sniff, IP, IPv6, TCP, UDP, ICMP
 
 def packet_callback(packet):
     """
-    Callback function that is executed for each captured packet.
-    It extracts key details like IPs, protocol, ports, and size,
-    and handles packets without IP layers gracefully.
+    Callback function executed automatically for each captured packet.
+    It extracts key details (IPs, protocol, ports, size) and prints
+    them in a readable format, handling non-IP packets gracefully.
     """
     try:
         # 1. Get the packet size in bytes.
-        # len() on a Scapy packet returns the size of the raw packet.
         packet_size = len(packet)
 
         # 2. Extract IP layer information if present.
@@ -52,8 +52,7 @@ def packet_callback(packet):
                 protocol = "UDP"
                 src_port = packet[UDP].sport
                 dst_port = packet[UDP].dport
-            # Scapy classes for ICMPv6 can vary (e.g., ICMPv6ND_NS, etc.).
-            # We can check if the next header protocol number is 58 (ICMPv6).
+            # ICMPv6 has protocol number 58
             elif next_header == 58:
                 protocol = "ICMP"
                 src_port = "N/A"
@@ -64,35 +63,42 @@ def packet_callback(packet):
                 dst_port = "N/A"
                 
         else:
-            # 3. Handle packets that don't have IP layers (e.g., ARP, STP, raw Layer 2 ethernet frames)
+            # 3. Handle packets that don't have IP layers (e.g., ARP, raw Ethernet frames)
             src_ip = "N/A"
             dst_ip = "N/A"
             protocol = "other"
             src_port = "N/A"
             dst_port = "N/A"
 
-        # 4. Print the packet details in a readable format.
+        # 4. Print the packet details in a clean, readable format.
         print(f"[+] Packet: {src_ip} -> {dst_ip} | Protocol: {protocol} | Ports: {src_port} -> {dst_port} | Size: {packet_size} bytes")
 
     except Exception as e:
-        # Catch any unexpected errors within the callback to prevent the sniffer from crashing.
+        # Catch unexpected errors within the callback to prevent the sniffer from crashing.
         print(f"[-] Error processing packet: {e}", file=sys.stderr)
 
-def capture_packets(count=20):
+def capture_packets(count=20, protocol_filter=None, interface=None):
     """
     Starts Scapy's packet sniffer.
-    - count: Number of packets to capture before stopping.
-    - prn: The callback function called on each packet.
-    - store: Set to False so Scapy doesn't keep packets in memory, reducing memory usage.
+    - count: Number of packets to capture.
+    - protocol_filter: BPF filter string (e.g., 'tcp', 'udp', 'icmp') to filter packets at kernel level.
+    - interface: Specific network interface to sniff on. None lets Scapy auto-select.
     """
-    print(f"[*] Starting packet capture. Sniffing {count} packets...")
+    # Print status message indicating what we are filtering and capturing
+    filter_desc = protocol_filter if protocol_filter else "all protocols"
+    iface_desc = interface if interface else "auto-select"
+    print(f"[*] Starting packet capture...")
+    print(f"[*] Interface: {iface_desc} | Filter: {filter_desc} | Count: {count}")
     print("[*] Note: On Windows, packet sniffing may require Administrator privileges or Npcap to be installed.")
     
     try:
         # sniff() is the core Scapy function that listens to network interfaces.
-        # prn=packet_callback runs our function for every captured packet.
-        # count specifies the limit of packets to capture.
-        sniff(prn=packet_callback, count=count, store=False)
+        # - prn: packet callback function.
+        # - count: stop after this many packets.
+        # - store=False: do not store packets in RAM.
+        # - filter: BPF filter string (efficient kernel-level filtering).
+        # - iface: specify interface.
+        sniff(prn=packet_callback, count=count, store=False, filter=protocol_filter, iface=interface)
         print("[*] Packet capture complete.")
     except PermissionError:
         print("[-] Error: Insufficient permissions. Please run the script as an Administrator.", file=sys.stderr)
@@ -100,5 +106,41 @@ def capture_packets(count=20):
         print(f"[-] An error occurred during capture: {e}", file=sys.stderr)
 
 if __name__ == '__main__':
-    # When executed directly, start the capture with a default count of 20 packets.
-    capture_packets(count=20)
+    # 1. Initialize argparse to parse command-line arguments.
+    parser = argparse.ArgumentParser(
+        description="A beginner-friendly live network packet sniffer using Scapy."
+    )
+    
+    # 2. Add optional command-line arguments with descriptions.
+    parser.add_argument(
+        "--protocol",
+        choices=["tcp", "udp", "icmp", "all"],
+        default="all",
+        help="Filter to only show packets of a specific protocol (choices: tcp, udp, icmp, all; default: all)"
+    )
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=20,
+        help="Number of packets to capture (default: 20)"
+    )
+    parser.add_argument(
+        "--interface",
+        default=None,
+        help="Specify which network interface to sniff on (default: let Scapy auto-select)"
+    )
+    
+    # 3. Parse the arguments passed to the script.
+    args = parser.parse_args()
+    
+    # 4. Map the user's protocol choice to a Scapy BPF (Berkeley Packet Filter) filter string.
+    # If the user selects 'icmp', we filter for both 'icmp' (IPv4) or 'icmp6' (IPv6).
+    bpf_filter = None
+    if args.protocol != "all":
+        if args.protocol == "icmp":
+            bpf_filter = "icmp or icmp6"
+        else:
+            bpf_filter = args.protocol
+            
+    # 5. Call capture_packets with the parsed arguments.
+    capture_packets(count=args.count, protocol_filter=bpf_filter, interface=args.interface)
