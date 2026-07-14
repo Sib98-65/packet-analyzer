@@ -12,11 +12,12 @@ from rich.panel import Panel
 console = Console()
 console_err = Console(stderr=True)
 
-def show_summary_and_export(captured_data, export_file=None):
+def show_summary_and_export(captured_data, export_file=None, detect_anomalies=False):
     """
-    Computes summary statistics and exports captured data to a CSV file.
+    Computes summary statistics, performs ML anomaly detection, and exports captured data to a CSV file.
     - captured_data: List of packet dictionaries.
     - export_file: Filename path for CSV output.
+    - detect_anomalies: Boolean to enable scikit-learn Isolation Forest anomaly detection.
     """
     total_packets = len(captured_data)
     if total_packets == 0:
@@ -38,7 +39,7 @@ def show_summary_and_export(captured_data, export_file=None):
     src_ips = [pkt["source_ip"] for pkt in captured_data if pkt["source_ip"] != "N/A"]
     top_talkers = Counter(src_ips).most_common(5)
 
-    # 2. Building the Rich panel content string
+    # 2. Build the Rich panel content string
     summary_text = []
     summary_text.append(f"Total Packets Captured: [cyan]{total_packets}[/cyan]")
     summary_text.append(f"Total Data Captured: [cyan]{total_kb:.2f} KB[/cyan] ({total_bytes} bytes)\n")
@@ -55,7 +56,107 @@ def show_summary_and_export(captured_data, export_file=None):
     else:
         summary_text.append("  No IP packets captured.")
 
-    # Panel with the summary
+    # 3. Perform Anomaly Detection if enabled
+    if detect_anomalies:
+        summary_text.append("\n[bold magenta]Anomaly Detection (Isolation Forest):[/bold magenta]")
+        
+        # Group packets by unique source IP (excluding non-IP packets marked "N/A")
+        ip_groups = {}
+        for pkt in captured_data:
+            ip = pkt["source_ip"]
+            if ip == "N/A":
+                continue
+            if ip not in ip_groups:
+                ip_groups[ip] = []
+            ip_groups[ip].append(pkt)
+
+        # We need at least 5 unique source IPs to establish a meaningful statistical baseline.
+        # Isolation Forest depends on comparing data distributions; too few samples leads to garbage outputs.
+        if len(ip_groups) < 5:
+            summary_text.append(f"  [yellow][*] Skipped: More data needed ({len(ip_groups)}/5 unique source IPs captured).[/yellow]")
+        else:
+            try:
+                from sklearn.ensemble import IsolationForest
+                import numpy as np
+                
+                ip_list = []
+                features_list = []
+                
+                # Engineer 4 features per source IP:
+                # 1. total packet count
+                # 2. unique destination ports contacted
+                # 3. average packet size
+                # 4. packets per second (using time spread)
+                for ip, pkts in ip_groups.items():
+                    pkt_count = len(pkts)
+                    unique_ports = len(set(p["destination_port"] for p in pkts if p["destination_port"] != "N/A"))
+                    avg_size = sum(p["size"] for p in pkts) / pkt_count
+                    epoch_times = [p["epoch_time"] for p in pkts]
+                    time_spread = max(epoch_times) - min(epoch_times)
+                    pps = pkt_count / time_spread if time_spread > 0 else float(pkt_count)
+                    
+                    ip_list.append(ip)
+                    features_list.append([pkt_count, unique_ports, avg_size, pps])
+                
+                X = np.array(features_list)
+                
+                # Isolation Forest isolates anomalies by randomly partitioning features.
+                # Outliers require fewer partitions/splits to isolate, placing them closer to the root of the trees.
+                # Contamination=0.1 specifies that we expect approximately 10% of unique source IPs to be anomalies.
+                # This is a standard assumption in security monitoring, expecting anomalous behavior to be a small minority.
+                model = IsolationForest(contamination=0.1, random_state=42)
+                predictions = model.fit_predict(X)
+                
+                # Compute baseline values of normal traffic (inliers = prediction of 1)
+                inliers = [features_list[i] for i, pred in enumerate(predictions) if pred == 1]
+                # If no inliers are found (very rare), fall back to the entire dataset
+                if not inliers:
+                    inliers = features_list
+                    
+                X_inliers = np.array(inliers)
+                mean_pkt_count = np.mean(X_inliers[:, 0])
+                mean_unique_ports = np.mean(X_inliers[:, 1])
+                mean_avg_size = np.mean(X_inliers[:, 2])
+                mean_pps = np.mean(X_inliers[:, 3])
+                
+                anomalies_found = False
+                for idx, pred in enumerate(predictions):
+                    # -1 indicates an anomaly/outlier flagged by Isolation Forest
+                    if pred == -1:
+                        ip = ip_list[idx]
+                        features = features_list[idx]
+                        pkt_count, unique_ports, avg_size, pps = features
+                        
+                        reasons = []
+                        # Compare the flagged IP's metrics with the normal baseline (mean of inliers)
+                        if pkt_count > mean_pkt_count * 2.0:
+                            reasons.append("unusually high packet count (possible Denial of Service or heavy transmission)")
+                        if unique_ports > mean_unique_ports * 2.0 and unique_ports > 2:
+                            reasons.append("unusually high unique destination ports contacted (possible port scan)")
+                        if avg_size > mean_avg_size * 2.0:
+                            reasons.append("unusually large average packet size (possible data exfiltration or large transfer)")
+                        if avg_size < mean_avg_size * 0.2:
+                            reasons.append("unusually small average packet size (possible ping scan or light polling)")
+                        if pps > mean_pps * 2.0:
+                            reasons.append("unusually high packet rate (possible flooding or automated scanning)")
+                            
+                        # If none of the simple rules trigger, it's flagged by a combination of factors
+                        if not reasons:
+                            reasons.append("unusual multi-feature combination of traffic patterns")
+                            
+                        explanation = ", ".join(reasons)
+                        summary_text.append(f"  [red]• IP: {ip}[/red] — {explanation}")
+                        anomalies_found = True
+                        
+                if not anomalies_found:
+                    summary_text.append("  [green]No anomalous source IPs detected (all traffic patterns within normal bounds).[/green]")
+                    
+            except ImportError:
+                summary_text.append("  [yellow][!] Error: scikit-learn or numpy is required to run anomaly detection.[/yellow]")
+            except Exception as e:
+                summary_text.append(f"  [red][-] Error running anomaly detection: {e}[/red]")
+
+    # Render a beautiful panel with the summary
     summary_panel = Panel(
         "\n".join(summary_text),
         title="[bold green]Capture Statistics[/bold green]",
@@ -64,7 +165,8 @@ def show_summary_and_export(captured_data, export_file=None):
     )
     console.print(summary_panel)
 
-    # 3. Export to CSV (built-in csv module)
+    # 4. Export to CSV. We try using pandas first (as requested),
+    # but fall back to the built-in csv module if there's a dependency / compatibility issue.
     if export_file:
         try:
             import pandas as pd
@@ -78,9 +180,10 @@ def show_summary_and_export(captured_data, export_file=None):
             console.print("[yellow][*] Attempting fallback export using Python's built-in csv module...[/yellow]")
             try:
                 import csv
-                keys = captured_data[0].keys()
+                # Exclude the temporary internal field 'epoch_time' from the CSV output
+                keys = [k for k in captured_data[0].keys() if k != "epoch_time"]
                 with open(export_file, 'w', newline='', encoding='utf-8') as f:
-                    dict_writer = csv.DictWriter(f, fieldnames=keys)
+                    dict_writer = csv.DictWriter(f, fieldnames=keys, extrasaction='ignore')
                     dict_writer.writeheader()
                     dict_writer.writerows(captured_data)
                 console.print(f"[bold green][+] Successfully exported capture data to [cyan]{export_file}[/cyan][/bold green]")
@@ -88,13 +191,14 @@ def show_summary_and_export(captured_data, export_file=None):
                 console_err.print(f"[bold red][-] Failed to export CSV: {csv_err}[/bold red]")
 
 
-def capture_packets(count=20, protocol_filter=None, interface=None, export_file=None):
+def capture_packets(count=20, protocol_filter=None, interface=None, export_file=None, detect_anomalies=False):
     """
     Starts Scapy's packet sniffer and displays results in a live-updating table.
     - count: Number of packets to capture.
     - protocol_filter: BPF filter string to filter packets at kernel level.
     - interface: Specific network interface to sniff on.
     - export_file: Filename to export capture data to.
+    - detect_anomalies: Enable anomaly detection on traffic.
     """
     # Map BPF filter or protocol name back to a readable format for the table title
     protocol_name = "all"
@@ -114,7 +218,7 @@ def capture_packets(count=20, protocol_filter=None, interface=None, export_file=
     console.print(f"[*] Interface: [cyan]{iface_desc}[/cyan] | Filter: [cyan]{filter_desc}[/cyan] | Count: [cyan]{count}[/cyan]")
     console.print("[*] Note: On Windows, packet sniffing may require Administrator privileges or Npcap to be installed.\n")
 
-    # Creating the Rich Table
+    # Create the Rich Table
     table = Table(title=table_title, show_header=True, header_style="bold magenta")
     table.add_column("No.", justify="right", style="cyan")
     table.add_column("Source IP", width=30)
@@ -207,6 +311,7 @@ def capture_packets(count=20, protocol_filter=None, interface=None, export_file=
             # Add to list of captured packets for summary and export
             captured_packets_data.append({
                 "timestamp": timestamp,
+                "epoch_time": pkt_time,
                 "source_ip": src_ip,
                 "destination_ip": dst_ip,
                 "protocol": protocol_plain,
@@ -231,7 +336,7 @@ def capture_packets(count=20, protocol_filter=None, interface=None, export_file=
             pass
 
     try:
-        # Using rich.live.Live as a context manager for terminal UI refresh
+        # Use rich.live.Live as a context manager for terminal UI refresh
         with Live(table, console=console, refresh_per_second=4):
             sniff(prn=packet_callback, count=count, store=False, filter=protocol_filter, iface=interface)
         
@@ -245,7 +350,7 @@ def capture_packets(count=20, protocol_filter=None, interface=None, export_file=
         console_err.print(f"\n[bold red][-] An error occurred: {e}[/bold red]")
     finally:
         # Show statistics summary and export data (runs on success, interrupt, or crash)
-        show_summary_and_export(captured_packets_data, export_file)
+        show_summary_and_export(captured_packets_data, export_file, detect_anomalies)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
@@ -273,6 +378,11 @@ if __name__ == '__main__':
         default=None,
         help="Path/filename to export the captured packets to as a CSV file (optional)"
     )
+    parser.add_argument(
+        "--detect-anomalies",
+        action="store_true",
+        help="Enable machine learning-based anomaly detection on captured traffic (requires scikit-learn)"
+    )
     
     args = parser.parse_args()
     
@@ -287,5 +397,6 @@ if __name__ == '__main__':
         count=args.count,
         protocol_filter=bpf_filter,
         interface=args.interface,
-        export_file=args.export
+        export_file=args.export,
+        detect_anomalies=args.detect_anomalies
     )
